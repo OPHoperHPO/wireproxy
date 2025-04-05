@@ -1,10 +1,12 @@
-# wireproxy
+# wireproxy 
 
 [![ISC licensed](https://img.shields.io/badge/license-ISC-blue)](./LICENSE)
 [![Build status](https://github.com/octeep/wireproxy/actions/workflows/build.yml/badge.svg)](https://github.com/octeep/wireproxy/actions)
 [![Documentation](https://img.shields.io/badge/godoc-wireproxy-blue)](https://pkg.go.dev/github.com/octeep/wireproxy)
 
 A wireguard client that exposes itself as a socks5/http proxy or tunnels.
+
+-- Modified to include automatic tunnel restarts on health check failures and UDP random packet tunnel warmups like AWG.
 
 # What is this
 
@@ -236,8 +238,17 @@ For example:
 PrivateKey = censored
 Address = 10.2.0.2/32
 DNS = 10.2.0.1
-CheckAlive = 1.1.1.1, 3.3.3.3
-CheckAliveInterval = 3
+CheckAlive = 1.1.1.1, 8.8.8.8
+CheckAliveInterval = 3 
+CheckAliveRestart = 1                # Enable automatic tunnel restart on failed health checks
+CheckAliveRestartMaxFailureCount = 4  # Maximum number of failed health checks before restarting
+CheckAliveRestartOnRandomPort = 1   # Restart tunnel using a random local port (client-side)
+UDPWarmup = 1                        # Enable UDP tunnel warmup on tunnel start or restart
+UDPWarmupMinPacketSize = 1024       # Minimum size of UDP warmup packets (in bytes)
+UDPWarmupMaxPacketSize = 12933      # Maximum size of UDP warmup packets (in bytes)
+UDPWarmupPacketCount = 4            # Total number of warmup packets sent to endpoints
+
+
 
 [Peer]
 PublicKey = censored

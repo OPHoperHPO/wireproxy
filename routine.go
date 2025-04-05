@@ -8,10 +8,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
-	"golang.zx2c4.com/wireguard/device"
 	"io"
 	"log"
 	"math/rand"
@@ -23,6 +19,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
+	"golang.zx2c4.com/wireguard/device"
 
 	"github.com/things-go/go-socks5"
 	"github.com/things-go/go-socks5/bufferpool"
@@ -50,6 +51,14 @@ type VirtualTun struct {
 	// PingRecord stores the last time an IP was pinged
 	PingRecord     map[string]uint64
 	PingRecordLock *sync.Mutex
+
+	// Track consecutive ping failures per IP
+	ConsecutivePingFailures map[string]int
+	ConsecutiveFailsLock    *sync.Mutex
+
+	// Flag to avoid repeated restarts in parallel
+	restarting     bool
+	restartingLock *sync.Mutex
 }
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
@@ -372,11 +381,33 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// recordSuccess resets the consecutive-fail count to 0 and updates the last ping time
+func (d VirtualTun) recordSuccess(addr netip.Addr) {
+	d.PingRecordLock.Lock()
+	d.PingRecord[addr.String()] = uint64(time.Now().Unix())
+	d.PingRecordLock.Unlock()
+
+	d.ConsecutiveFailsLock.Lock()
+	d.ConsecutivePingFailures[addr.String()] = 0
+	d.ConsecutiveFailsLock.Unlock()
+}
+
+// incrementFailure bumps the consecutive failure count and checks for > 5
+func (d VirtualTun) incrementFailure(addr netip.Addr) {
+	d.ConsecutiveFailsLock.Lock()
+	fails := d.ConsecutivePingFailures[addr.String()]
+	fails++
+	d.ConsecutivePingFailures[addr.String()] = fails
+	d.ConsecutiveFailsLock.Unlock()
+}
+
 func (d VirtualTun) pingIPs() {
 	for _, addr := range d.Conf.CheckAlive {
 		socket, err := d.Tnet.Dial("ping", addr.String())
 		if err != nil {
 			errorLogger.Printf("Failed to ping %s: %s\n", addr, err.Error())
+			// If dial fails, increment consecutive failure right away
+			d.incrementFailure(addr)
 			continue
 		}
 
@@ -402,20 +433,24 @@ func (d VirtualTun) pingIPs() {
 		_, err = socket.Write(icmpBytes)
 		if err != nil {
 			errorLogger.Printf("Failed to ping %s: %s\n", addr, err.Error())
+			d.incrementFailure(addr)
 			continue
 		}
 
 		addr := addr
+		addrCopy := addr
 		go func() {
 			n, err := socket.Read(icmpBytes[:])
 			if err != nil {
 				errorLogger.Printf("Failed to read ping response from %s: %s\n", addr, err.Error())
+				d.incrementFailure(addrCopy)
 				return
 			}
 
 			replyPacket, err := icmp.ParseMessage(1, icmpBytes[:n])
 			if err != nil {
 				errorLogger.Printf("Failed to parse ping response from %s: %s\n", addr, err.Error())
+				d.incrementFailure(addrCopy)
 				return
 			}
 
@@ -423,10 +458,12 @@ func (d VirtualTun) pingIPs() {
 				replyPing, ok := replyPacket.Body.(*icmp.Echo)
 				if !ok {
 					errorLogger.Printf("Failed to parse ping response from %s: invalid reply type: %s\n", addr, replyPacket.Type)
+					d.incrementFailure(addrCopy)
 					return
 				}
 				if !bytes.Equal(replyPing.Data, requestPing.Data) || replyPing.Seq != requestPing.Seq {
 					errorLogger.Printf("Failed to parse ping response from %s: invalid ping reply: %v\n", addr, replyPing)
+					d.incrementFailure(addrCopy)
 					return
 				}
 			}
@@ -435,6 +472,7 @@ func (d VirtualTun) pingIPs() {
 				replyPing, ok := replyPacket.Body.(*icmp.RawBody)
 				if !ok {
 					errorLogger.Printf("Failed to parse ping response from %s: invalid reply type: %s\n", addr, replyPacket.Type)
+					d.incrementFailure(addrCopy)
 					return
 				}
 
@@ -442,27 +480,183 @@ func (d VirtualTun) pingIPs() {
 				pongBody := replyPing.Data[4:]
 				if !bytes.Equal(pongBody, requestPing.Data) || int(seq) != requestPing.Seq {
 					errorLogger.Printf("Failed to parse ping response from %s: invalid ping reply: %v\n", addr, replyPing)
+					d.incrementFailure(addrCopy)
 					return
 				}
 			}
 
-			d.PingRecordLock.Lock()
-			d.PingRecord[addr.String()] = uint64(time.Now().Unix())
-			d.PingRecordLock.Unlock()
+			// If we get here, ping was successful
+			d.recordSuccess(addrCopy)
 
 			defer socket.Close()
 		}()
 	}
 }
 
+func (d VirtualTun) setRestartingFlag() {
+	d.restartingLock.Lock()
+	d.restarting = true
+	d.restartingLock.Unlock()
+}
+func (d VirtualTun) clearRestartingFlag() {
+	d.restartingLock.Lock()
+	d.restarting = false
+	d.restartingLock.Unlock()
+}
+
+func (d VirtualTun) restartOnSamePort() {
+	if d.restarting {
+		return
+	}
+	errorLogger.Printf("Restarting WireGuard tunnel on the same port...\n")
+	d.setRestartingFlag()
+
+	err := d.Dev.Down()
+	if err != nil {
+		errorLogger.Printf("Failed to bring down WireGuard device: %v\n", err)
+		d.clearRestartingFlag()
+		return
+	}
+
+	if d.Conf.UDPWarmup {
+		err = sendRandomUDPPackets(d.Conf, *d.Conf.ListenPort, d.Conf.Peers)
+		if err != nil {
+			errorLogger.Printf("Failed to send random UDP packets: %v\n", err)
+			d.clearRestartingFlag()
+			return
+		}
+	}
+
+	err = d.Dev.Up()
+	if err != nil {
+		errorLogger.Printf("Failed to bring up WireGuard device: %v\n", err)
+		d.clearRestartingFlag()
+		return
+	}
+
+	d.resetPingStatistics()
+	errorLogger.Printf("WireGuard tunnel successfully restarted.\n")
+	d.clearRestartingFlag()
+	return
+}
+
+func (d VirtualTun) restartOnDifferentPort() {
+	if d.restarting {
+		return
+	}
+	errorLogger.Printf("Restarting WireGuard tunnel on a different port...\n")
+	d.setRestartingFlag()
+
+
+
+	// 1) Attempt a rebind on the existing device
+	newPort, err := selectFreePort()
+	if err != nil {
+		errorLogger.Printf("Failed to pick a new port: %v\n", err)
+		d.clearRestartingFlag()
+		return
+	}
+	errorLogger.Printf("Selected new port: %d\n", newPort)
+
+	// Update config with the newly selected port
+	d.Conf.ListenPort = &newPort
+	setting, err := CreateIPCRequest(d.Conf)
+	if err != nil {
+		errorLogger.Printf("Failed to create IPC request for new port: %v\n", err)
+		d.clearRestartingFlag()
+		return
+	}
+
+	// Bring device down
+	if err := d.Dev.Down(); err != nil {
+		errorLogger.Printf("Failed to bring down device before rebind: %v\n", err)
+		d.clearRestartingFlag()
+		return
+	}
+
+	// (Optional) Send out random warmup packets on the new port
+	if d.Conf.UDPWarmup {
+		if warmErr := sendRandomUDPPackets(d.Conf, *d.Conf.ListenPort, d.Conf.Peers); warmErr != nil {
+			errorLogger.Printf("Failed sending random warmup packets on new port: %v\n", warmErr)
+			// Not a fatal error necessarily; you could choose to continue or fallback
+		}
+	}
+
+	// IpcSet with the updated config that includes the new port
+	if err := d.Dev.IpcSet(setting.IpcRequest); err != nil {
+		errorLogger.Printf("Failed applying new port config (IpcSet): %v\n", err)
+		d.clearRestartingFlag()
+		return
+	}
+
+	// Bring device back up
+	if err := d.Dev.Up(); err != nil {
+		errorLogger.Printf("Failed to bring device up after rebind: %v\n", err)
+		d.clearRestartingFlag()
+		return
+	}
+
+	d.resetPingStatistics()
+
+	errorLogger.Printf("WireGuard tunnel successfully restarted.\n")
+	d.clearRestartingFlag()
+}
+
+func (d *VirtualTun) resetPingStatistics() {
+	// 4) Reinitialize the ping record and consecutive ping failures
+	d.PingRecordLock.Lock()
+	d.ConsecutiveFailsLock.Lock()
+
+	for _, addr := range d.Conf.CheckAlive {
+		d.PingRecord[addr.String()] = 0
+		d.ConsecutivePingFailures[addr.String()] = 0
+	}
+
+	d.ConsecutiveFailsLock.Unlock()
+	d.PingRecordLock.Unlock()
+}
+
+// killAndRestartTunnel closes the current Device and re-calls StartWireguard using the same config.
+// It then repopulates this VirtualTun's fields with the newly created device/tunnel.
+func (d *VirtualTun) killAndRestartTunnel() {
+	errorLogger.Printf("Too many ping failures. Closing WireGuard device and restarting...\n")
+
+	if d.Conf.CheckAliveRestartOnRandomPort {
+		d.restartOnDifferentPort()
+	} else {
+		d.restartOnSamePort()
+	}
+	return
+}
+
+func (d VirtualTun) restartOnFailure() {
+	if !d.Conf.CheckAliveRestart ||
+		d.restarting ||
+		d.Conf.CheckAliveRestartMaxFailureCount <= 0 {
+		return
+	}
+
+	// Check if we need to restart the tunnel
+	for addr, fails := range d.ConsecutivePingFailures {
+		if fails > d.Conf.CheckAliveRestartMaxFailureCount {
+			errorLogger.Printf("Too many ping failures for %s (%d). Restarting tunnel...\n", addr, fails)
+			d.killAndRestartTunnel()
+			break
+		}
+	}
+}
+
 func (d VirtualTun) StartPingIPs() {
 	for _, addr := range d.Conf.CheckAlive {
 		d.PingRecord[addr.String()] = 0
+		d.ConsecutivePingFailures[addr.String()] = 0
 	}
 
 	go func() {
 		for {
 			d.pingIPs()
+			// Check if we need to restart the tunnel
+			d.restartOnFailure()
 			time.Sleep(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
 		}
 	}()

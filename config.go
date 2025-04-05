@@ -31,6 +31,13 @@ type DeviceConfig struct {
 	ListenPort         *int
 	CheckAlive         []netip.Addr
 	CheckAliveInterval int
+	CheckAliveRestart                bool
+	CheckAliveRestartMaxFailureCount int
+	CheckAliveRestartOnRandomPort    bool
+	UDPWarmup                        bool
+	UDPWarmupMinPacketSize         int
+	UDPWarmupMaxPacketSize         int
+	UDPWarmupPacketCount          int
 }
 
 type TCPClientTunnelConfig struct {
@@ -175,7 +182,7 @@ func parseCIDRNetIP(section *ini.Section, keyName string) ([]netip.Addr, error) 
 		if len(str) == 0 {
 			continue
 		}
-    
+
 		if addr, err := netip.ParseAddr(str); err == nil {
 			ips = append(ips, addr)
 		} else {
@@ -183,7 +190,7 @@ func parseCIDRNetIP(section *ini.Section, keyName string) ([]netip.Addr, error) 
 			if err != nil {
 				return nil, err
 			}
-      
+
 			addr := prefix.Addr()
 			ips = append(ips, addr)
 		}
@@ -296,6 +303,92 @@ func ParseInterface(cfg *ini.File, device *DeviceConfig) error {
 		device.CheckAliveInterval = value
 	}
 
+	device.CheckAliveRestart = false
+	if sectionKey, err := section.GetKey("CheckAliveRestart"); err == nil {
+		value, err := sectionKey.Bool()
+		if err != nil {
+			return err
+		}
+		if len(checkAlive) == 0 {
+			return errors.New("CheckAliveRestart is only valid when CheckAlive is set")
+		}
+		if device.CheckAliveInterval == 0 {
+			return errors.New("CheckAliveRestart is only valid when CheckAliveInterval is set")
+		}
+		device.CheckAliveRestart = value
+	}
+
+	device.CheckAliveRestartMaxFailureCount = 3
+	if sectionKey, err := section.GetKey("CheckAliveRestartMaxFailureCount"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		if value < 1 {
+			return errors.New("CheckAliveRestartMaxFailureCount should be >= 1")
+		}
+		device.CheckAliveRestartMaxFailureCount = value
+	}
+
+	device.CheckAliveRestartOnRandomPort = false
+	if sectionKey, err := section.GetKey("CheckAliveRestartOnRandomPort"); err == nil {
+		value, err := sectionKey.Bool()
+		if err != nil {
+			return err
+		}
+		device.CheckAliveRestartOnRandomPort = value
+	}
+
+	device.UDPWarmup = false
+	if sectionKey, err := section.GetKey("UDPWarmup"); err == nil {
+		value, err := sectionKey.Bool()
+		if err != nil {
+			return err
+		}
+		device.UDPWarmup = value
+	}
+
+
+
+	device.UDPWarmupMaxPacketSize = 65507
+	if sectionKey, err := section.GetKey("UDPWarmupMaxPacketSize"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		if value < 0 {
+			return errors.New("UDPWarmupMaxPacketSize should be >= 0")
+		}
+		device.UDPWarmupMaxPacketSize = value
+	}
+
+	device.UDPWarmupMinPacketSize = 1024
+	if sectionKey, err := section.GetKey("UDPWarmupMinPacketSize"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		if value < 0 {
+			return errors.New("UDPWarmupMinPacketSize should be >= 0")
+		}
+		if value > device.UDPWarmupMaxPacketSize {
+			return errors.New("UDPWarmupMinPacketSize should be <= UDPWarmupMaxPacketSize")
+		}
+
+		device.UDPWarmupMinPacketSize = value
+	}
+
+	device.UDPWarmupPacketCount = 4
+	if sectionKey, err := section.GetKey("UDPWarmupPacketCount"); err == nil {
+		value, err := sectionKey.Int()
+		if err != nil {
+			return err
+		}
+		if value < 0 {
+			return errors.New("UDPWarmupPacketCount should be >= 0")
+		}
+		device.UDPWarmupPacketCount = value
+	}
 	return nil
 }
 

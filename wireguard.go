@@ -2,10 +2,14 @@ package wireproxy
 
 import (
 	"bytes"
+	"crypto/rand"
 	"fmt"
-	"sync"
-
+	"io"
+	mrand "math/rand"
+	"net"
 	"net/netip"
+	"sync"
+	"time"
 
 	"github.com/MakeNowJust/heredoc/v2"
 	"golang.zx2c4.com/wireguard/conn"
@@ -59,8 +63,93 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 	return setting, nil
 }
 
+// sendRandomUDPPackets dials a UDP socket from the given localPort and sends a few
+// small random payloads to each peer Endpoint, if present.
+func sendRandomUDPPackets(conf *DeviceConfig, localPort int, peers []PeerConfig) error {
+	packetsPerPeer := conf.UDPWarmupPacketCount // how many packets to send to each peer
+	minSize := conf.UDPWarmupMinPacketSize
+	maxSize := conf.UDPWarmupMaxPacketSize
+	chunkSize := 1400 // how many bytes to send per chunk
+
+	mrand.Seed(time.Now().UnixNano())
+
+	// Listen on the chosen port from "the normal network."
+	ln, err := net.ListenUDP("udp", &net.UDPAddr{
+		IP:   net.IPv4zero, // 0.0.0.0
+		Port: localPort,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to listen on local UDP port %d: %w", localPort, err)
+	}
+	defer ln.Close()
+
+	for _, p := range peers {
+		if p.Endpoint == nil || *p.Endpoint == "" {
+			continue
+		}
+
+		remoteAddr, err := net.ResolveUDPAddr("udp", *p.Endpoint)
+		if err != nil {
+			errorLogger.Printf("warning: cannot resolve endpoint %q: %v\n", *p.Endpoint, err)
+			continue
+		}
+
+		errorLogger.Printf("Sending random UDP packets to %s\n", remoteAddr)
+		for i := 0; i < packetsPerPeer; i++ {
+			// Generate random data length in [minSize..maxSize]
+			dataLen := mrand.Intn(maxSize-minSize+1) + minSize
+			errorLogger.Printf("Sending random UDP packet of total size %d bytes (in chunks)\n", dataLen)
+
+			// Create the entire payload (for demonstration)
+			payload := make([]byte, dataLen)
+			if _, err := io.ReadFull(rand.Reader, payload); err != nil {
+				errorLogger.Printf("warning: random payload generation failed: %v\n", err)
+				continue
+			}
+
+			// Chunk and send
+			offset := 0
+			for offset < dataLen {
+				end := offset + chunkSize
+				if end > dataLen {
+					end = dataLen
+				}
+				chunk := payload[offset:end]
+				offset = end
+
+				_, sendErr := ln.WriteToUDP(chunk, remoteAddr)
+				if sendErr != nil {
+					errorLogger.Printf("warning: sending chunk to %v failed: %v\n", remoteAddr, sendErr)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func selectFreePort() (int, error) {
+	conn, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to acquire ephemeral port: %w", err)
+	}
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.Port, nil
+}
+
 // StartWireguard creates a tun interface on netstack given a configuration
 func StartWireguard(conf *DeviceConfig, logLevel int) (*VirtualTun, error) {
+	// If no listen port specified, pick a random free UDP port.
+	if conf.ListenPort == nil {
+		port, err := selectFreePort()
+		if err != nil {
+			return nil, fmt.Errorf("failed to select a free port: %w", err)
+		}
+		conf.ListenPort = &port
+		errorLogger.Printf("No listen port specified, picking a random free UDP port: %d\n", port)
+	}
+
 	setting, err := CreateIPCRequest(conf)
 	if err != nil {
 		return nil, err
@@ -70,6 +159,14 @@ func StartWireguard(conf *DeviceConfig, logLevel int) (*VirtualTun, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	if conf.UDPWarmup {
+		err = sendRandomUDPPackets(conf, *conf.ListenPort, conf.Peers)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send random UDP packets: %w", err)
+		}
+	}
+
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel, ""))
 	err = dev.IpcSet(setting.IpcRequest)
 	if err != nil {
@@ -88,5 +185,12 @@ func StartWireguard(conf *DeviceConfig, logLevel int) (*VirtualTun, error) {
 		SystemDNS:      len(setting.DNS) == 0,
 		PingRecord:     make(map[string]uint64),
 		PingRecordLock: new(sync.Mutex),
+
+		ConsecutivePingFailures: make(map[string]int),
+		ConsecutiveFailsLock:    new(sync.Mutex),
+
+		// Flag to avoid repeated restarts in parallel
+		restarting:     false,
+		restartingLock: new(sync.Mutex),
 	}, nil
 }
