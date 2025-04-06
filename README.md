@@ -2,6 +2,32 @@
 
 A wireguard client that exposes itself as a socks5/http proxy or tunnels. Modified to include automatic tunnel restarts on health check failures and UDP random packet tunnel warmups like AWG.
 
+```ini
+[Interface]
+PrivateKey = censored
+Address = 10.2.0.2/32
+DNS = 10.2.0.1
+CheckAlive = 1.1.1.1, 8.8.8.8
+CheckAliveInterval = 3 
+CheckAliveRestart = 1                # Enable automatic tunnel restart on failed health checks
+CheckAliveRestartMaxFailureCount = 4  # Maximum number of failed health checks before restarting
+CheckAliveRestartOnRandomPort = 1   # Restart tunnel using a random local port (client-side)
+UDPWarmup = 1                        # Enable UDP tunnel warmup on tunnel start or restart
+UDPWarmupMinPacketSize = 1024       # Minimum size of UDP warmup packets (in bytes)
+UDPWarmupMaxPacketSize = 12933      # Maximum size of UDP warmup packets (in bytes)
+UDPWarmupPacketCount = 4            # Total number of warmup packets sent to endpoints
+
+
+
+[Peer]
+PublicKey = censored
+AllowedIPs = 0.0.0.0/0
+Endpoint = 149.34.244.174:51820
+
+[Socks5]
+BindAddress = 127.0.0.1:25344
+```
+
 # OLD README
 
 # What is this
