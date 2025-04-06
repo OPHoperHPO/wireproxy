@@ -1,5 +1,8 @@
 name: Build container
 on:
+  create:
+     tags:
+       - v*
   push:
     branches:
       - master
@@ -20,7 +23,8 @@ jobs:
     runs-on: ubuntu-20.04
 
     env:
-      CONTAINER_NAME: ghcr.io/${{ github.repository }}
+      # force lowercase for tags
+      CONTAINER_NAME: ghcr.io/ophoperhpo/wireproxy
       BUILD_PLATFORMS: linux/amd64,linux/arm,linux/arm64,linux/ppc64le,linux/s390x
       RAW_CONTAINER_TAG: ${{ github.event.inputs.container_tag || github.event.pull_request.head.ref || 'latest' }}
       RAW_REF_NAME: ${{ github.event.pull_request.head.ref || github.ref }}
