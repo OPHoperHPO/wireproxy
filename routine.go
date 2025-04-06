@@ -382,7 +382,7 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // recordSuccess resets the consecutive-fail count to 0 and updates the last ping time
-func (d VirtualTun) recordSuccess(addr netip.Addr) {
+func (d *VirtualTun) recordSuccess(addr netip.Addr) {
 	d.PingRecordLock.Lock()
 	d.PingRecord[addr.String()] = uint64(time.Now().Unix())
 	d.PingRecordLock.Unlock()
@@ -393,7 +393,7 @@ func (d VirtualTun) recordSuccess(addr netip.Addr) {
 }
 
 // incrementFailure bumps the consecutive failure count and checks for > 5
-func (d VirtualTun) incrementFailure(addr netip.Addr) {
+func (d *VirtualTun) incrementFailure(addr netip.Addr) {
 	d.ConsecutiveFailsLock.Lock()
 	fails := d.ConsecutivePingFailures[addr.String()]
 	fails++
@@ -493,18 +493,18 @@ func (d VirtualTun) pingIPs() {
 	}
 }
 
-func (d VirtualTun) setRestartingFlag() {
+func (d *VirtualTun) setRestartingFlag() {
 	d.restartingLock.Lock()
 	d.restarting = true
 	d.restartingLock.Unlock()
 }
-func (d VirtualTun) clearRestartingFlag() {
+func (d *VirtualTun) clearRestartingFlag() {
 	d.restartingLock.Lock()
 	d.restarting = false
 	d.restartingLock.Unlock()
 }
 
-func (d VirtualTun) restartOnSamePort() {
+func (d *VirtualTun) restartOnSamePort() {
 	if d.restarting {
 		return
 	}
@@ -537,10 +537,9 @@ func (d VirtualTun) restartOnSamePort() {
 	d.resetPingStatistics()
 	errorLogger.Printf("WireGuard tunnel successfully restarted.\n")
 	d.clearRestartingFlag()
-	return
 }
 
-func (d VirtualTun) restartOnDifferentPort() {
+func (d *VirtualTun) restartOnDifferentPort() {
 	if d.restarting {
 		return
 	}
@@ -626,10 +625,9 @@ func (d *VirtualTun) killAndRestartTunnel() {
 	} else {
 		d.restartOnSamePort()
 	}
-	return
 }
 
-func (d VirtualTun) restartOnFailure() {
+func (d *VirtualTun) restartOnFailure() {
 	if !d.Conf.CheckAliveRestart ||
 		d.restarting ||
 		d.Conf.CheckAliveRestartMaxFailureCount <= 0 {

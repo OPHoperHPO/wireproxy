@@ -71,7 +71,7 @@ func sendRandomUDPPackets(conf *DeviceConfig, localPort int, peers []PeerConfig)
 	maxSize := conf.UDPWarmupMaxPacketSize
 	chunkSize := 1400 // how many bytes to send per chunk
 
-	mrand.Seed(time.Now().UnixNano())
+	rng := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 
 	// Listen on the chosen port from "the normal network."
 	ln, err := net.ListenUDP("udp", &net.UDPAddr{
@@ -97,7 +97,7 @@ func sendRandomUDPPackets(conf *DeviceConfig, localPort int, peers []PeerConfig)
 		errorLogger.Printf("Sending random UDP packets to %s\n", remoteAddr)
 		for i := 0; i < packetsPerPeer; i++ {
 			// Generate random data length in [minSize..maxSize]
-			dataLen := mrand.Intn(maxSize-minSize+1) + minSize
+			dataLen := rng.Intn(maxSize-minSize+1) + minSize
 			errorLogger.Printf("Sending random UDP packet of total size %d bytes (in chunks)\n", dataLen)
 
 			// Create the entire payload (for demonstration)
