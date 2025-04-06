@@ -1,12 +1,8 @@
 # wireproxy 
 
-[![ISC licensed](https://img.shields.io/badge/license-ISC-blue)](./LICENSE)
-[![Build status](https://github.com/octeep/wireproxy/actions/workflows/build.yml/badge.svg)](https://github.com/octeep/wireproxy/actions)
-[![Documentation](https://img.shields.io/badge/godoc-wireproxy-blue)](https://pkg.go.dev/github.com/octeep/wireproxy)
+A wireguard client that exposes itself as a socks5/http proxy or tunnels. Modified to include automatic tunnel restarts on health check failures and UDP random packet tunnel warmups like AWG.
 
-A wireguard client that exposes itself as a socks5/http proxy or tunnels.
-
--- Modified to include automatic tunnel restarts on health check failures and UDP random packet tunnel warmups like AWG.
+# OLD README
 
 # What is this
 
