@@ -3,7 +3,6 @@ on:
   push:
     branches:
       - master
-  pull_request:
 
   # Allow for manually running
   workflow_dispatch:
@@ -44,10 +43,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      # Needed for buildx gha cache to work
-      - name: Expose GitHub Runtime
-        uses: crazy-max/ghaction-github-runtime@v3
 
       - name: Build container
         env:
