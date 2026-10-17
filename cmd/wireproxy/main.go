@@ -11,11 +11,12 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/landlock-lsm/go-landlock/landlock"
 
-	"github.com/akamensky/argparse"
 	"github.com/OPHoperHPO/wireproxy"
+	"github.com/akamensky/argparse"
 	"golang.zx2c4.com/wireguard/device"
 	"suah.dev/protect"
 )
@@ -279,20 +280,21 @@ func main() {
 
 	lock("ready", tlsFilePaths(conf.Routines)...)
 
-	tun, err := wireproxy.StartWireguard(conf, logLevel)
+	tunnels, err := wireproxy.StartTunnels(conf, logLevel)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	for _, spawner := range conf.Routines {
-		go spawner.SpawnRoutine(tun)
+		go spawner.SpawnRoutine(tunnels)
 	}
 
-	tun.StartPingIPs()
+	tunnels.StartHealthChecks()
 
 	if *info != "" {
 		go func() {
-			err := http.ListenAndServe(*info, tun)
+			server := &http.Server{Addr: *info, Handler: tunnels, ReadHeaderTimeout: 10 * time.Second}
+			err := server.ListenAndServe()
 			if err != nil {
 				panic(err)
 			}

@@ -29,6 +29,7 @@ of wireproxy by [@artem-russkikh](https://github.com/artem-russkikh).
 # Feature
 
 - TCP static routing for client and server
+- Failover between several wireguard servers
 - SOCKS5/HTTP proxy (currently only CONNECT is supported)
 - Transparent TLS ([SNI](https://en.wikipedia.org/wiki/Server_Name_Indication)) proxy
 
@@ -255,6 +256,49 @@ AllowedIPs = 10.254.254.100/32
 # Note there is no Endpoint defined here.
 ```
 
+# Failover
+
+Give `WGConfig` several times to connect to several servers at once. The
+first config is preferred; the others are hot standbys that stay connected.
+
+```ini
+WGConfig = primary.conf
+WGConfig = backup.conf
+
+[Failover]
+# A new TCP connection waits this long on a tunnel before the next tunnel is
+# tried in parallel; the first connection established wins. (default: 1s)
+FallbackDelay = 1s
+# Failed health checks in a row that mark a tunnel as down. (default: 2)
+FailAfter = 2
+# Successful health checks in a row that bring a tunnel back. (default: 3)
+RecoverAfter = 3
+# Close connections of a tunnel that went down, so clients reconnect through
+# a healthy tunnel at once instead of hanging until a timeout. (default: true)
+CloseOnDown = true
+
+[Socks5]
+BindAddress = 127.0.0.1:25344
+```
+
+Health checks use `CheckAlive` and `CheckAliveInterval` from the `[Interface]`
+section of each config, so set them in every file (for example
+`CheckAlive = 1.1.1.1` and `CheckAliveInterval = 1`). A tunnel without
+`CheckAlive` is always considered up and only falls back per connection.
+
+New connections go to the most preferred healthy tunnel, and switch back to it
+once it recovers. Connections already open on a healthy tunnel are never
+moved. A TCP connection cannot move to another server, since the remote end
+sees a different address, so a connection on a dead tunnel is closed and the
+client reconnects through the next one. Names are resolved through the tunnel
+that carries the connection. Tunnel names in logs and `/readyz` come from the
+config file names. Each config must use its own `ListenPort`, if any.
+
+While a new TCP connection is raced, the destination may see a connection
+attempt from more than one server. A config without `DNS` resolves names with
+the system resolver, outside the tunnel. `TCPServerTunnel` listens on the
+first tunnel only.
+
 # Health endpoint
 
 Wireproxy supports exposing a health endpoint for monitoring purposes.
@@ -264,7 +308,8 @@ Currently two endpoints are implemented:
 
 `/metrics`: Exposes information of the wireguard daemon, this provides the same information you would get with `wg show`. [This](https://www.wireguard.com/xplatform/#example-dialog) shows an example of what the response would look like.
 
-`/readyz`: This responds with a json which shows the last time a pong is received from an IP specified with `CheckAlive`. When `CheckAlive` is set, a ping is sent out to addresses in `CheckAlive` per `CheckAliveInterval` seconds (defaults to 5) via wireguard. If a pong has not been received from one of the addresses within the last `CheckAliveInterval` seconds (+2 seconds for some leeway to account for latency), then it would respond with a 503, otherwise a 200.
+`/readyz`: This responds with a json which shows the last time a pong is received from an IP specified with `CheckAlive`. When `CheckAlive` is set, a ping is sent out to addresses in `CheckAlive` per `CheckAliveInterval` seconds (defaults to 5) via wireguard. If a pong has not been received from one of the addresses within the last `CheckAliveInterval` seconds (+2 seconds for some leeway to account for latency), then it would respond with a 503, otherwise a 200. With several tunnels, the response
+lists every tunnel with its state and pings, and is a 503 only when no tunnel is healthy.
 
 For example:
 

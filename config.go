@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-ini/ini"
 
@@ -25,6 +27,8 @@ type PeerConfig struct {
 
 // DeviceConfig contains the information to initiate a wireguard connection
 type DeviceConfig struct {
+	// Name identifies the tunnel in logs and health reports
+	Name               string
 	SecretKey          string
 	Endpoint           []netip.Addr
 	Peers              []PeerConfig
@@ -85,10 +89,28 @@ type ResolveConfig struct {
 	ResolveStrategy string
 }
 
+// FailoverConfig tunes switching between tunnels when several are configured
+type FailoverConfig struct {
+	// FallbackDelay is how long a new TCP connection waits on a tunnel before
+	// the next tunnel is tried in parallel
+	FallbackDelay time.Duration
+	// FailAfter is the number of failed health checks in a row that mark a
+	// tunnel as down
+	FailAfter int
+	// RecoverAfter is the number of successful health checks in a row that
+	// mark a tunnel as up again
+	RecoverAfter int
+	// CloseOnDown closes connections of a tunnel that went down, so clients
+	// reconnect through a healthy one at once instead of waiting for timeouts
+	CloseOnDown bool
+}
+
 type Configuration struct {
-	Device   *DeviceConfig
+	// Devices holds one entry per tunnel, in order of preference
+	Devices  []*DeviceConfig
 	Routines []RoutineSpawner
 	Resolve  *ResolveConfig
+	Failover *FailoverConfig
 }
 
 func parseString(section *ini.Section, keyName string) (string, error) {
@@ -153,10 +175,10 @@ func parseBase64KeyToHex(section *ini.Section, keyName string) (string, error) {
 func encodeBase64ToHex(key string) (string, error) {
 	decoded, err := base64.StdEncoding.DecodeString(key)
 	if err != nil {
-		return "", errors.New("invalid base64 string: " + key)
+		return "", errors.New("invalid base64 key")
 	}
 	if len(decoded) != 32 {
-		return "", errors.New("key should be 32 bytes: " + key)
+		return "", errors.New("key should be 32 bytes")
 	}
 	return hex.EncodeToString(decoded), nil
 }
@@ -629,37 +651,16 @@ func ParseConfig(path string) (*Configuration, error) {
 		return nil, err
 	}
 
-	device := &DeviceConfig{
-		MTU: 1420,
-	}
-
 	resolve := &ResolveConfig{
 		ResolveStrategy: "auto",
 	}
 
-	root := cfg.Section("")
-	wgConf, err := root.GetKey("WGConfig")
-	wgCfg := cfg
-	if err == nil {
-		wgPath := wgConf.String()
-		// A bare filename (no path separators) is resolved relative to the
-		// directory of the parent config file, so the wg config can sit
-		// alongside the wireproxy config without needing a full path.
-		if filepath.Base(wgPath) == wgPath {
-			wgPath = filepath.Join(filepath.Dir(path), wgPath)
-		}
-		wgCfg, err = ini.LoadSources(iniOpt, wgPath)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	err = ParseInterface(wgCfg, device)
+	devices, err := parseDevices(cfg, path, iniOpt)
 	if err != nil {
 		return nil, err
 	}
 
-	err = ParsePeers(wgCfg, &device.Peers)
+	failover, err := parseFailoverConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -709,8 +710,137 @@ func ParseConfig(path string) (*Configuration, error) {
 	}
 
 	return &Configuration{
-		Device:   device,
+		Devices:  devices,
 		Routines: routinesSpawners,
 		Resolve:  resolve,
+		Failover: failover,
 	}, nil
+}
+
+// parseDevices reads the wireguard configuration of every tunnel. Each
+// WGConfig key adds one tunnel, in order of preference; without WGConfig the
+// [Interface] and [Peer] sections of the main file describe a single tunnel.
+func parseDevices(cfg *ini.File, path string, iniOpt ini.LoadOptions) ([]*DeviceConfig, error) {
+	var wgPaths []string
+	if key, err := cfg.Section("").GetKey("WGConfig"); err == nil {
+		for _, wgPath := range key.ValueWithShadows() {
+			wgPath = strings.TrimSpace(wgPath)
+			if wgPath == "" {
+				continue
+			}
+			// A bare filename (no path separators) is resolved relative to the
+			// directory of the parent config file, so the wg config can sit
+			// alongside the wireproxy config without needing a full path.
+			if filepath.Base(wgPath) == wgPath {
+				wgPath = filepath.Join(filepath.Dir(path), wgPath)
+			}
+			wgPaths = append(wgPaths, wgPath)
+		}
+	}
+
+	if len(wgPaths) == 0 {
+		device, err := parseDevice(cfg)
+		if err != nil {
+			return nil, err
+		}
+		device.Name = "wg0"
+		return []*DeviceConfig{device}, nil
+	}
+
+	devices := make([]*DeviceConfig, 0, len(wgPaths))
+	names := make(map[string]bool)
+	ports := make(map[int]bool)
+	for _, wgPath := range wgPaths {
+		wgCfg, err := ini.LoadSources(iniOpt, wgPath)
+		if err != nil {
+			return nil, err
+		}
+		device, err := parseDevice(wgCfg)
+		if err != nil {
+			return nil, errors.New(filepath.Base(wgPath) + ": " + err.Error())
+		}
+
+		base := strings.TrimSuffix(filepath.Base(wgPath), filepath.Ext(wgPath))
+		name := base
+		for i := 2; names[name]; i++ {
+			name = base + "-" + strconv.Itoa(i)
+		}
+		names[name] = true
+		device.Name = name
+
+		if device.ListenPort != nil && *device.ListenPort != 0 {
+			if ports[*device.ListenPort] {
+				return nil, errors.New(name + ": ListenPort is used by another tunnel")
+			}
+			ports[*device.ListenPort] = true
+		}
+		devices = append(devices, device)
+	}
+	return devices, nil
+}
+
+func parseDevice(cfg *ini.File) (*DeviceConfig, error) {
+	device := &DeviceConfig{
+		MTU: 1420,
+	}
+
+	if err := ParseInterface(cfg, device); err != nil {
+		return nil, err
+	}
+
+	if err := ParsePeers(cfg, &device.Peers); err != nil {
+		return nil, err
+	}
+
+	return device, nil
+}
+
+func parseFailoverConfig(cfg *ini.File) (*FailoverConfig, error) {
+	config := &FailoverConfig{
+		FallbackDelay: time.Second,
+		FailAfter:     2,
+		RecoverAfter:  3,
+		CloseOnDown:   true,
+	}
+
+	section, err := cfg.GetSection("Failover")
+	if err != nil {
+		return config, nil
+	}
+
+	if key, err := section.GetKey("FallbackDelay"); err == nil {
+		value, err := time.ParseDuration(key.String())
+		if err != nil {
+			return nil, errors.New("FallbackDelay: " + err.Error())
+		}
+		if value <= 0 {
+			return nil, errors.New("FallbackDelay should be greater than zero")
+		}
+		config.FallbackDelay = value
+	}
+
+	for keyName, target := range map[string]*int{"FailAfter": &config.FailAfter, "RecoverAfter": &config.RecoverAfter} {
+		key, err := section.GetKey(keyName)
+		if err != nil {
+			continue
+		}
+		value, err := key.Int()
+		if err != nil {
+			return nil, errors.New(keyName + ": " + err.Error())
+		}
+		if value <= 0 {
+			return nil, errors.New(keyName + " should be greater than zero")
+		}
+		*target = value
+	}
+
+	if key, err := section.GetKey("CloseOnDown"); err == nil {
+		value, err := key.Bool()
+		if err != nil {
+			return nil, errors.New("CloseOnDown: " + err.Error())
+		}
+		config.CloseOnDown = value
+	}
+
+	return config, nil
 }

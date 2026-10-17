@@ -59,9 +59,9 @@ func CreateIPCRequest(conf *DeviceConfig) (*DeviceSetting, error) {
 	return setting, nil
 }
 
-// StartWireguard creates a tun interface on netstack given a configuration
-func StartWireguard(conf *Configuration, logLevel int) (*VirtualTun, error) {
-	deviceConf := conf.Device
+// StartWireguard creates a tun interface on netstack given the configuration
+// of a single tunnel
+func StartWireguard(deviceConf *DeviceConfig, resolve *ResolveConfig, logLevel int) (*VirtualTun, error) {
 	setting, err := CreateIPCRequest(deviceConf)
 	if err != nil {
 		return nil, err
@@ -71,7 +71,11 @@ func StartWireguard(conf *Configuration, logLevel int) (*VirtualTun, error) {
 	if err != nil {
 		return nil, err
 	}
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel, ""))
+	prefix := ""
+	if deviceConf.Name != "" {
+		prefix = "(" + deviceConf.Name + ") "
+	}
+	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel, prefix))
 	err = dev.IpcSet(setting.IpcRequest)
 	if err != nil {
 		dev.Close()
@@ -95,20 +99,39 @@ func StartWireguard(conf *Configuration, logLevel int) (*VirtualTun, error) {
 		}
 	}
 
-	if conf.Resolve.ResolveStrategy == "auto" {
+	// every tunnel picks its own strategy from its own addresses
+	resolveConf := *resolve
+	if resolveConf.ResolveStrategy == "auto" {
 		if hasV4 && !hasV6 {
-			conf.Resolve.ResolveStrategy = "ipv4"
+			resolveConf.ResolveStrategy = "ipv4"
 		} else {
-			conf.Resolve.ResolveStrategy = "ipv6"
+			resolveConf.ResolveStrategy = "ipv6"
 		}
 	}
 	return &VirtualTun{
+		Name:           deviceConf.Name,
 		Tnet:           tnet,
 		Dev:            dev,
 		Conf:           deviceConf,
-		ResolveConfig:  conf.Resolve,
+		ResolveConfig:  &resolveConf,
 		SystemDNS:      len(setting.DNS) == 0,
 		PingRecord:     make(map[string]uint64),
 		PingRecordLock: new(sync.Mutex),
 	}, nil
+}
+
+// StartTunnels brings up every configured tunnel and groups them for failover
+func StartTunnels(conf *Configuration, logLevel int) (*TunnelGroup, error) {
+	tunnels := make([]*VirtualTun, 0, len(conf.Devices))
+	for _, deviceConf := range conf.Devices {
+		vt, err := StartWireguard(deviceConf, conf.Resolve, logLevel)
+		if err != nil {
+			for _, started := range tunnels {
+				started.Dev.Close()
+			}
+			return nil, fmt.Errorf("%s: %w", deviceConf.Name, err)
+		}
+		tunnels = append(tunnels, vt)
+	}
+	return NewTunnelGroup(tunnels, conf.Failover), nil
 }

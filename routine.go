@@ -6,15 +6,13 @@ import (
 	srand "crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
-	"net/http"
 	"os"
-	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +42,8 @@ type CredentialValidator struct {
 
 // VirtualTun stores a reference to netstack network and DNS configuration
 type VirtualTun struct {
+	// Name identifies the tunnel in logs and health reports
+	Name          string
 	Tnet          *netstack.Net
 	Dev           *device.Device
 	SystemDNS     bool
@@ -56,7 +56,7 @@ type VirtualTun struct {
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
 type RoutineSpawner interface {
-	SpawnRoutine(vt *VirtualTun)
+	SpawnRoutine(tg *TunnelGroup)
 }
 
 type addressPort struct {
@@ -118,19 +118,6 @@ func (d VirtualTun) ResolveAddrWithContext(ctx context.Context, name string) (*n
 	return &addrs_all[0], nil
 }
 
-// Resolve resolves a hostname and returns an IP.
-// DNS traffic may or may not be routed depending on VirtualTun's setting
-func (d VirtualTun) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	log.Printf("Resolving address for %s\n", name)
-
-	addr, err := d.ResolveAddrWithContext(ctx, name)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return ctx, addr.AsSlice(), nil
-}
-
 func parseAddressPort(endpoint string) (*addressPort, error) {
 	name, sport, err := net.SplitHostPort(endpoint)
 	if err != nil {
@@ -166,41 +153,12 @@ func (passthroughResolver) Resolve(ctx context.Context, name string) (context.Co
 	return ctx, nil, nil
 }
 
-// RoutedDial returns a dialer that sends whitelisted hosts through the tunnel
-// and dials everything else directly. Used by the HTTP and SNI proxies, whose
-// dial callbacks receive the destination hostname intact.
-func (d VirtualTun) RoutedDial(router *DomainRouter) func(network, address string) (net.Conn, error) {
-	return func(network, address string) (net.Conn, error) {
-		if router.route(hostFromAddr(address)) {
-			return d.Tnet.Dial(network, address)
-		}
-		return net.Dial(network, address)
-	}
-}
-
-// routedSocks5Dial returns a socks5 dial-with-request callback that routes based
-// on the original destination FQDN (preserved on request.DestAddr), falling back
-// to the address host for IP-literal targets.
-func (d VirtualTun) routedSocks5Dial(router *DomainRouter) func(context.Context, string, string, *socks5.Request) (net.Conn, error) {
-	return func(ctx context.Context, network, address string, request *socks5.Request) (net.Conn, error) {
-		host := request.DestAddr.FQDN
-		if host == "" {
-			host = hostFromAddr(address)
-		}
-		if router.route(host) {
-			return d.Tnet.DialContext(ctx, network, address)
-		}
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, address)
-	}
-}
-
 // SpawnRoutine spawns a socks5 server.
-func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
+func (config *Socks5Config) SpawnRoutine(tg *TunnelGroup) {
 	var authMethods []socks5.Authenticator
-	if username := config.Username; username != "" {
+	if config.Username != "" || config.Password != "" {
 		authMethods = append(authMethods, socks5.UserPassAuthenticator{
-			Credentials: socks5.StaticCredentials{username: config.Password},
+			Credentials: socks5.StaticCredentials{config.Username: config.Password},
 		})
 	} else {
 		authMethods = append(authMethods, socks5.NoAuthAuthenticator{})
@@ -211,18 +169,19 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
 	}
 
+	// Names are resolved at dial time, on the tunnel that carries the
+	// connection, so a failing tunnel cannot stall name resolution.
+	options = append(options, socks5.WithResolver(passthroughResolver{}))
 	if len(config.TunnelDomains) == 0 && !config.LogDomains {
-		// Legacy path: everything through the tunnel, resolved via tunnel DNS.
-		options = append(options,
-			socks5.WithDial(vt.Tnet.DialContext),
-			socks5.WithResolver(vt),
-		)
+		// Legacy path: everything through the tunnel.
+		options = append(options, socks5.WithDial(tg.DialContext))
 	} else {
 		// Split-routing path: keep the FQDN so we can decide per connection.
 		router := NewDomainRouter(config.TunnelDomains, config.LogDomains)
 		options = append(options,
-			socks5.WithDialAndRequest(vt.routedSocks5Dial(router)),
-			socks5.WithResolver(passthroughResolver{}),
+			socks5.WithDialAndRequest(tg.routedSocks5Dial(router)),
+			// UDP ASSOCIATE only uses the plain dialer
+			socks5.WithDial(tg.routedDialContext(router)),
 		)
 	}
 
@@ -234,11 +193,11 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 }
 
 // SpawnRoutine spawns a http server.
-func (config *HTTPConfig) SpawnRoutine(vt *VirtualTun) {
+func (config *HTTPConfig) SpawnRoutine(tg *TunnelGroup) {
 	router := NewDomainRouter(config.TunnelDomains, config.LogDomains)
 	server := &HTTPServer{
 		config: config,
-		dial:   vt.RoutedDial(router),
+		dial:   tg.RoutedDial(router),
 		auth:   CredentialValidator{config.Username, config.Password},
 	}
 	if config.Username != "" || config.Password != "" {
@@ -274,17 +233,8 @@ func connForward(from io.ReadWriteCloser, to io.ReadWriteCloser) {
 }
 
 // tcpClientForward starts a new connection via wireguard and forward traffic from `conn`
-func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
-	target, err := vt.resolveToAddrPort(raddr)
-	if err != nil {
-		_ = conn.Close()
-		errorLogger.Printf("TCP Server Tunnel to %s: %s\n", target, err.Error())
-		return
-	}
-
-	tcpAddr := net.TCPAddrFromAddrPort(*target)
-
-	sconn, err := vt.Tnet.DialTCP(tcpAddr)
+func tcpClientForward(tg *TunnelGroup, target string, conn net.Conn) {
+	sconn, err := tg.DialContext(context.Background(), "tcp", target)
 	if err != nil {
 		_ = conn.Close()
 		errorLogger.Printf("TCP Client Tunnel to %s: %s\n", target, err.Error())
@@ -296,17 +246,10 @@ func tcpClientForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 }
 
 // STDIOTcpForward starts a new connection via wireguard and forward traffic from `conn`
-func STDIOTcpForward(vt *VirtualTun, raddr *addressPort, input *os.File, output *os.File) {
-	target, err := vt.resolveToAddrPort(raddr)
+func STDIOTcpForward(tg *TunnelGroup, target string, input *os.File, output *os.File) {
+	sconn, err := tg.DialContext(context.Background(), "tcp", target)
 	if err != nil {
-		errorLogger.Printf("Name resolution error for %s: %s\n", raddr.address, err.Error())
-		return
-	}
-
-	tcpAddr := net.TCPAddrFromAddrPort(*target)
-	sconn, err := vt.Tnet.DialTCP(tcpAddr)
-	if err != nil {
-		errorLogger.Printf("TCP Client Tunnel to %s (%s): %s\n", target, tcpAddr, err.Error())
+		errorLogger.Printf("TCP Client Tunnel to %s: %s\n", target, err.Error())
 		return
 	}
 
@@ -315,9 +258,8 @@ func STDIOTcpForward(vt *VirtualTun, raddr *addressPort, input *os.File, output 
 }
 
 // SpawnRoutine spawns a local TCP server which acts as a proxy to the specified target
-func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	raddr, err := parseAddressPort(conf.Target)
-	if err != nil {
+func (conf *TCPClientTunnelConfig) SpawnRoutine(tg *TunnelGroup) {
+	if _, err := parseAddressPort(conf.Target); err != nil {
 		log.Fatal(err)
 	}
 
@@ -331,18 +273,17 @@ func (conf *TCPClientTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		go tcpClientForward(vt, raddr, conn)
+		go tcpClientForward(tg, conf.Target, conn)
 	}
 }
 
 // SpawnRoutine connects to the specified target and plumbs it to STDIN / STDOUT
-func (conf *STDIOTunnelConfig) SpawnRoutine(vt *VirtualTun) {
-	raddr, err := parseAddressPort(conf.Target)
-	if err != nil {
+func (conf *STDIOTunnelConfig) SpawnRoutine(tg *TunnelGroup) {
+	if _, err := parseAddressPort(conf.Target); err != nil {
 		log.Fatal(err)
 	}
 
-	go STDIOTcpForward(vt, raddr, conf.Input, conf.Output)
+	go STDIOTcpForward(tg, conf.Target, conf.Input, conf.Output)
 }
 
 // tcpServerForward starts a new connection locally and forward traffic from `conn`
@@ -368,13 +309,15 @@ func tcpServerForward(vt *VirtualTun, raddr *addressPort, conn net.Conn) {
 
 }
 
-// SpawnRoutine spawns a TCP server on wireguard which acts as a proxy to the specified target
-func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+// SpawnRoutine spawns a TCP server on wireguard which acts as a proxy to the specified target.
+// It listens on the first tunnel only, so backup servers get no inbound access.
+func (conf *TCPServerTunnelConfig) SpawnRoutine(tg *TunnelGroup) {
 	raddr, err := parseAddressPort(conf.Target)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	vt := tg.Tunnels()[0]
 	addr := &net.TCPAddr{Port: conf.ListenPort}
 	server, err := vt.Tnet.ListenTCP(addr)
 	if err != nil {
@@ -391,9 +334,9 @@ func (conf *TCPServerTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 }
 
 // SpawnRoutine spawns an SNI proxy server.
-func (config *SNIConfig) SpawnRoutine(vt *VirtualTun) {
+func (config *SNIConfig) SpawnRoutine(tg *TunnelGroup) {
 	router := NewDomainRouter(config.TunnelDomains, config.LogDomains)
-	dial := vt.RoutedDial(router)
+	dial := tg.RoutedDial(router)
 
 	listener, err := net.Listen("tcp", config.BindAddress)
 	if err != nil {
@@ -409,180 +352,154 @@ func (config *SNIConfig) SpawnRoutine(vt *VirtualTun) {
 	}
 }
 
-func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Health metric request: %s\n", r.URL.Path)
-	switch path.Clean(r.URL.Path) {
-	case "/readyz":
-		d.PingRecordLock.Lock()
-		records := make(map[string]uint64, len(d.PingRecord))
-		for addr, record := range d.PingRecord {
-			records[addr] = record
-		}
-		d.PingRecordLock.Unlock()
-
-		body, err := json.Marshal(records)
-		if err != nil {
-			errorLogger.Printf("Failed to get device metrics: %s\n", err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		status := http.StatusOK
-		for _, record := range records {
-			lastPong := time.Unix(int64(record), 0)
-			// +2 seconds to account for the time it takes to ping the IP
-			if time.Since(lastPong) > time.Duration(d.Conf.CheckAliveInterval+2)*time.Second {
-				status = http.StatusServiceUnavailable
-				break
-			}
-		}
-
-		w.WriteHeader(status)
-		_, _ = w.Write(body)
-		_, _ = w.Write([]byte("\n"))
-	case "/metrics":
-		get, err := d.Dev.IpcGet()
-		if err != nil {
-			errorLogger.Printf("Failed to get device metrics: %s\n", err.Error())
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		var buf bytes.Buffer
-		for _, peer := range strings.Split(get, "\n") {
-			pair := strings.SplitN(peer, "=", 2)
-			if len(pair) != 2 {
-				buf.WriteString(peer)
-				continue
-			}
-			if pair[0] == "private_key" || pair[0] == "preshared_key" {
-				pair[1] = "REDACTED"
-			}
-			buf.WriteString(pair[0])
-			buf.WriteString("=")
-			buf.WriteString(pair[1])
-			buf.WriteString("\n")
-		}
-
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(buf.Bytes())
-	default:
-		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-func (d VirtualTun) pingIPs() {
-	for _, addr := range d.Conf.CheckAlive {
-		socket, err := d.Tnet.Dial("ping", addr.String())
-		if err != nil {
-			errorLogger.Printf("Failed to ping %s: %s\n", addr, err.Error())
-			continue
-		}
-		if !addr.Is4() && !addr.Is6() {
-			errorLogger.Printf("Failed to ping %s: invalid address: %s\n", addr, addr.String())
-			_ = socket.Close()
-			continue
-		}
-
-		data := make([]byte, 16)
-		if _, err := srand.Read(data); err != nil {
-			errorLogger.Printf("Failed to generate ping data for %s: %s\n", addr, err.Error())
-			_ = socket.Close()
-			continue
-		}
-
-		requestPing := icmp.Echo{
-			Seq:  rand.Intn(1 << 16),
-			Data: data,
-		}
-
-		var icmpBytes []byte
-		if addr.Is4() {
-			icmpBytes, err = (&icmp.Message{Type: ipv4.ICMPTypeEcho, Code: 0, Body: &requestPing}).Marshal(nil)
-		} else if addr.Is6() {
-			icmpBytes, err = (&icmp.Message{Type: ipv6.ICMPTypeEchoRequest, Code: 0, Body: &requestPing}).Marshal(nil)
-		}
-		if err != nil {
-			errorLogger.Printf("Failed to marshal ping request for %s: %s\n", addr, err.Error())
-			_ = socket.Close()
-			continue
-		}
-
-		if err := socket.SetReadDeadline(time.Now().Add(time.Duration(d.Conf.CheckAliveInterval) * time.Second)); err != nil {
-			errorLogger.Printf("Failed to set ping deadline for %s: %s\n", addr, err.Error())
-			_ = socket.Close()
-			continue
-		}
-		_, err = socket.Write(icmpBytes)
-		if err != nil {
-			errorLogger.Printf("Failed to ping %s: %s\n", addr, err.Error())
-			_ = socket.Close()
-			continue
-		}
-
-		go func(addr netip.Addr, socket net.Conn, requestPing icmp.Echo) {
-			defer func() { _ = socket.Close() }()
-			readBytes := make([]byte, 1500)
-			n, err := socket.Read(readBytes)
-			if err != nil {
-				errorLogger.Printf("Failed to read ping response from %s: %s\n", addr, err.Error())
-				return
-			}
-
-			replyPacket, err := icmp.ParseMessage(1, readBytes[:n])
-			if err != nil {
-				errorLogger.Printf("Failed to parse ping response from %s: %s\n", addr, err.Error())
-				return
-			}
-
-			if addr.Is4() {
-				replyPing, ok := replyPacket.Body.(*icmp.Echo)
-				if !ok {
-					errorLogger.Printf("Failed to parse ping response from %s: invalid reply type: %s\n", addr, replyPacket.Type)
-					return
-				}
-				if !bytes.Equal(replyPing.Data, requestPing.Data) || replyPing.Seq != requestPing.Seq {
-					errorLogger.Printf("Failed to parse ping response from %s: invalid ping reply: %v\n", addr, replyPing)
-					return
-				}
-			}
-
-			if addr.Is6() {
-				replyPing, ok := replyPacket.Body.(*icmp.RawBody)
-				if !ok {
-					errorLogger.Printf("Failed to parse ping response from %s: invalid reply type: %s\n", addr, replyPacket.Type)
-					return
-				}
-				if len(replyPing.Data) < 4 {
-					errorLogger.Printf("Failed to parse ping response from %s: reply too short\n", addr)
-					return
-				}
-
-				seq := binary.BigEndian.Uint16(replyPing.Data[2:4])
-				pongBody := replyPing.Data[4:]
-				if !bytes.Equal(pongBody, requestPing.Data) || int(seq) != requestPing.Seq {
-					errorLogger.Printf("Failed to parse ping response from %s: invalid ping reply: %v\n", addr, replyPing)
-					return
-				}
-			}
-
-			d.PingRecordLock.Lock()
-			d.PingRecord[addr.String()] = uint64(time.Now().Unix())
-			d.PingRecordLock.Unlock()
-		}(addr, socket, requestPing)
-	}
-}
-
-func (d VirtualTun) StartPingIPs() {
+// pingRecords returns a copy of the last pong time per CheckAlive address
+func (d VirtualTun) pingRecords() map[string]uint64 {
 	d.PingRecordLock.Lock()
-	for _, addr := range d.Conf.CheckAlive {
-		d.PingRecord[addr.String()] = 0
+	defer d.PingRecordLock.Unlock()
+	records := make(map[string]uint64, len(d.PingRecord))
+	for addr, record := range d.PingRecord {
+		records[addr] = record
 	}
-	d.PingRecordLock.Unlock()
+	return records
+}
 
-	go func() {
-		for {
-			d.pingIPs()
-			time.Sleep(time.Duration(d.Conf.CheckAliveInterval) * time.Second)
+// pingsStale reports whether a CheckAlive address has not answered recently
+func (d VirtualTun) pingsStale(records map[string]uint64) bool {
+	for _, record := range records {
+		lastPong := time.Unix(int64(record), 0)
+		// +2 seconds to account for the time it takes to ping the IP
+		if time.Since(lastPong) > time.Duration(d.Conf.CheckAliveInterval+2)*time.Second {
+			return true
 		}
-	}()
+	}
+	return false
+}
+
+// metrics returns the device state as `wg show` would, without secrets
+func (d VirtualTun) metrics() ([]byte, error) {
+	get, err := d.Dev.IpcGet()
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	for _, peer := range strings.Split(get, "\n") {
+		pair := strings.SplitN(peer, "=", 2)
+		if len(pair) != 2 {
+			buf.WriteString(peer)
+			continue
+		}
+		if pair[0] == "private_key" || pair[0] == "preshared_key" {
+			pair[1] = "REDACTED"
+		}
+		buf.WriteString(pair[0])
+		buf.WriteString("=")
+		buf.WriteString(pair[1])
+		buf.WriteString("\n")
+	}
+	return buf.Bytes(), nil
+}
+
+// ping sends one ICMP echo request to addr through the tunnel and waits for
+// the matching reply until deadline.
+func (d VirtualTun) ping(addr netip.Addr, deadline time.Time) error {
+	if !addr.Is4() && !addr.Is6() {
+		return errors.New("invalid address: " + addr.String())
+	}
+
+	socket, err := d.Tnet.Dial("ping", addr.String())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = socket.Close() }()
+
+	data := make([]byte, 16)
+	if _, err := srand.Read(data); err != nil {
+		return err
+	}
+
+	requestPing := icmp.Echo{
+		Seq:  rand.Intn(1 << 16),
+		Data: data,
+	}
+
+	var icmpBytes []byte
+	if addr.Is4() {
+		icmpBytes, err = (&icmp.Message{Type: ipv4.ICMPTypeEcho, Code: 0, Body: &requestPing}).Marshal(nil)
+	} else {
+		icmpBytes, err = (&icmp.Message{Type: ipv6.ICMPTypeEchoRequest, Code: 0, Body: &requestPing}).Marshal(nil)
+	}
+	if err != nil {
+		return err
+	}
+
+	if err := socket.SetDeadline(deadline); err != nil {
+		return err
+	}
+	if _, err := socket.Write(icmpBytes); err != nil {
+		return err
+	}
+
+	readBytes := make([]byte, 1500)
+	n, err := socket.Read(readBytes)
+	if err != nil {
+		return err
+	}
+
+	replyPacket, err := icmp.ParseMessage(1, readBytes[:n])
+	if err != nil {
+		return err
+	}
+
+	if addr.Is4() {
+		replyPing, ok := replyPacket.Body.(*icmp.Echo)
+		if !ok {
+			return fmt.Errorf("invalid reply type: %s", replyPacket.Type)
+		}
+		if !bytes.Equal(replyPing.Data, requestPing.Data) || replyPing.Seq != requestPing.Seq {
+			return fmt.Errorf("invalid ping reply: %v", replyPing)
+		}
+	} else {
+		replyPing, ok := replyPacket.Body.(*icmp.RawBody)
+		if !ok {
+			return fmt.Errorf("invalid reply type: %s", replyPacket.Type)
+		}
+		if len(replyPing.Data) < 4 {
+			return errors.New("reply too short")
+		}
+
+		seq := binary.BigEndian.Uint16(replyPing.Data[2:4])
+		pongBody := replyPing.Data[4:]
+		if !bytes.Equal(pongBody, requestPing.Data) || int(seq) != requestPing.Seq {
+			return fmt.Errorf("invalid ping reply: %v", replyPing)
+		}
+	}
+
+	d.PingRecordLock.Lock()
+	d.PingRecord[addr.String()] = uint64(time.Now().Unix())
+	d.PingRecordLock.Unlock()
+	return nil
+}
+
+// probe pings every CheckAlive address in parallel and reports whether at
+// least one of them answered within timeout.
+func (d VirtualTun) probe(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	results := make(chan bool, len(d.Conf.CheckAlive))
+	for _, addr := range d.Conf.CheckAlive {
+		go func(addr netip.Addr) {
+			err := d.ping(addr, deadline)
+			if err != nil {
+				errorLogger.Printf("Failed to ping %s via %s: %s\n", addr, d.Name, err.Error())
+			}
+			results <- err == nil
+		}(addr)
+	}
+
+	alive := false
+	for range d.Conf.CheckAlive {
+		if <-results {
+			alive = true
+		}
+	}
+	return alive
 }

@@ -1,6 +1,7 @@
 package wireproxy
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -41,7 +42,7 @@ func (s *udpSession) close() {
 // SpawnRoutine implements the RoutineSpawner interface.
 // It starts listening on config.BindAddress, handling each unique source (client) address
 // with its own udpSession. If InactivityTimeout > 0, sessions automatically close after inactivity
-func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
+func (conf *UDPProxyTunnelConfig) SpawnRoutine(tg *TunnelGroup) {
 	addr, err := net.ResolveUDPAddr("udp", conf.BindAddress)
 	if err != nil {
 		log.Fatalf("UDPProxyTunnelConfig: could not resolve bind address %s: %v", conf.BindAddress, err)
@@ -98,7 +99,7 @@ func (conf *UDPProxyTunnelConfig) SpawnRoutine(vt *VirtualTun) {
 		}
 
 		// Create a new session
-		remoteConn, err := vt.Tnet.Dial("udp", conf.Target)
+		remoteConn, err := tg.DialContext(context.Background(), "udp", conf.Target)
 		if err != nil {
 			return nil, fmt.Errorf("UDPProxyTunnel: could not Dial(%s): %w", conf.Target, err)
 		}
