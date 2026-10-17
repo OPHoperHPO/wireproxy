@@ -6,16 +6,19 @@ on:
 
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test wireproxy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Setting up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.26"
+          go-version: "1.27"
       - name: Install dependencies
         run: sudo apt install wireguard curl
       - name: Building wireproxy

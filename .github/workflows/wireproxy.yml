@@ -2,9 +2,12 @@ name: Cross compile WireProxy
 
 on:
   workflow_dispatch:
-  create:
-     tags:
-       - v*
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   WireProxy:
@@ -13,39 +16,33 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    env:
-      workdir: ./WireProxy
-
     steps:
       - name: Checkout code
-        uses: actions/checkout@master
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Git clone WireProxy
-        run: |
-          git clone https://github.com/OPHoperHPO/wireproxy.git ${{ env.workdir }}
-          cp ./.github/wireproxy-releaser.yml ${{ env.workdir }}/.goreleaser.yml
+      - name: Prepare GoReleaser config
+        run: cp ./.github/wireproxy-releaser.yml ./.goreleaser.yml
 
-      - name: Set up GoReleaser
-        uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v7
         with:
-          go-version: "1.26"
+          go-version: "1.27"
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v5
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          workdir: ${{ env.workdir }}
-          version: latest
+          version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Release binaries
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: wireproxy
-          files: ${{ env.workdir }}/dist/*.tar.gz
+          files: dist/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
