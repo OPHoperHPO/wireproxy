@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/landlock-lsm/go-landlock/landlock"
 	"log"
 	"net"
 	"net/http"
@@ -13,8 +12,10 @@ import (
 	"strconv"
 	"syscall"
 
+	"github.com/landlock-lsm/go-landlock/landlock"
+
 	"github.com/akamensky/argparse"
-	"github.com/pufferffish/wireproxy"
+	"github.com/OPHoperHPO/wireproxy"
 	"golang.zx2c4.com/wireguard/device"
 	"suah.dev/protect"
 )
@@ -23,9 +24,9 @@ import (
 const daemonProcess = "daemon-process"
 
 // default paths for wireproxy config file
-var default_config_paths = []string {
-    "/etc/wireproxy/wireproxy.conf",
-    os.Getenv("HOME")+"/.config/wireproxy.conf",
+var default_config_paths = []string{
+	"/etc/wireproxy/wireproxy.conf",
+	os.Getenv("HOME") + "/.config/wireproxy.conf",
 }
 
 var version = "1.0.8-dev"
@@ -59,15 +60,33 @@ func executablePath() string {
 
 // check if default config file paths exist
 func configFilePath() (string, bool) {
-    for _, path := range default_config_paths {
-        if _, err := os.Stat(path); err == nil {
-            return path, true
-        }
-    }
-    return "", false
+	for _, path := range default_config_paths {
+		if _, err := os.Stat(path); err == nil {
+			return path, true
+		}
+	}
+	return "", false
 }
 
-func lock(stage string) {
+// get the file paths for TLS cert and key from the config
+func tlsFilePaths(routines []wireproxy.RoutineSpawner) []string {
+	var paths []string
+	for _, routine := range routines {
+		http, ok := routine.(*wireproxy.HTTPConfig)
+		if !ok {
+			continue
+		}
+		if http.CertFile != "" {
+			paths = append(paths, http.CertFile)
+		}
+		if http.KeyFile != "" {
+			paths = append(paths, http.KeyFile)
+		}
+	}
+	return paths
+}
+
+func lock(stage string, roFilles ...string) {
 	switch stage {
 	case "boot":
 		exePath := executablePath()
@@ -80,6 +99,7 @@ func lock(stage string) {
 		// Linux
 		panicIfError(landlock.V1.BestEffort().RestrictPaths(
 			landlock.RODirs("/"),
+			landlock.RWFiles("/dev/null").IgnoreIfMissing(),
 		))
 	case "boot-daemon":
 	case "read-config":
@@ -91,7 +111,11 @@ func lock(stage string) {
 		pledgeOrPanic("stdio inet dns")
 		// Linux
 		net.DefaultResolver.PreferGo = true // needed to lock down dependencies
-		panicIfError(landlock.V1.BestEffort().RestrictPaths(
+
+		// We need to define the static rules beforehand,
+		// so we can add the provided dynamic rules
+
+		rules := []landlock.Rule{
 			landlock.ROFiles("/etc/resolv.conf").IgnoreIfMissing(),
 			landlock.ROFiles("/dev/fd").IgnoreIfMissing(),
 			landlock.ROFiles("/dev/zero").IgnoreIfMissing(),
@@ -110,7 +134,16 @@ func lock(stage string) {
 			landlock.RWFiles("/dev/null").IgnoreIfMissing(),
 			landlock.RWFiles("/dev/full").IgnoreIfMissing(),
 			landlock.RWFiles("/proc/self/fd").IgnoreIfMissing(),
-		))
+		}
+
+		if len(roFilles) > 0 {
+			for _, file := range roFilles {
+				rules = append(rules, landlock.ROFiles(file).IgnoreIfMissing())
+			}
+		}
+
+		panicIfError(landlock.V1.BestEffort().RestrictPaths(rules...))
+
 	default:
 		panic("invalid stage")
 	}
@@ -143,8 +176,10 @@ func lockNetwork(sections []wireproxy.RoutineSpawner, infoAddr *string) {
 		case *wireproxy.HTTPConfig:
 			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
 		case *wireproxy.TCPClientTunnelConfig:
-			rules = append(rules, landlock.ConnectTCP(uint16(section.BindAddress.Port)))
+			rules = append(rules, landlock.BindTCP(uint16(section.BindAddress.Port)))
 		case *wireproxy.Socks5Config:
+			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
+		case *wireproxy.SNIConfig:
 			rules = append(rules, landlock.BindTCP(extractPort(section.BindAddress)))
 		}
 	}
@@ -193,12 +228,12 @@ func main() {
 	}
 
 	if *config == "" {
-        if path, config_exist := configFilePath(); config_exist {
-            *config = path
-        } else {
-            fmt.Println("configuration path is required")
-            return
-        }
+		if path, config_exist := configFilePath(); config_exist {
+			*config = path
+		} else {
+			fmt.Println("configuration path is required")
+			return
+		}
 	}
 
 	if !*daemon {
@@ -236,15 +271,15 @@ func main() {
 	// Wireguard doesn't allow configuring which FD to use for logging
 	// https://github.com/WireGuard/wireguard-go/blob/master/device/logger.go#L39
 	// so redirect STDOUT to STDERR, we don't want to print anything to STDOUT anyways
-	os.Stdout = os.NewFile(uintptr(syscall.Stderr), "/dev/stderr")
+	os.Stdout = os.Stderr
 	logLevel := device.LogLevelVerbose
 	if *silent {
 		logLevel = device.LogLevelSilent
 	}
 
-	lock("ready")
+	lock("ready", tlsFilePaths(conf.Routines)...)
 
-	tun, err := wireproxy.StartWireguard(conf.Device, logLevel)
+	tun, err := wireproxy.StartWireguard(conf, logLevel)
 	if err != nil {
 		log.Fatal(err)
 	}
